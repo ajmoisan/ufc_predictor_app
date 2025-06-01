@@ -1,36 +1,48 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
-import streamlit as st
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score
+from sklearn.impute import SimpleImputer
 import warnings
-
 warnings.filterwarnings("ignore")
 
-# --- Load Data ---
+# --- Load and Clean Data ---
 @st.cache_data
 def load_data():
     df = pd.read_csv("ufc-master.csv")
+
+    # Rename columns
+    df.rename(columns={
+        'RedHeightCms': 'RedHeight',
+        'BlueHeightCms': 'BlueHeight',
+        'RedReachCms': 'RedReach',
+        'BlueReachCms': 'BlueReach',
+        'RedWeightLbs': 'RedWeight',
+        'BlueWeightLbs': 'BlueWeight'
+    }, inplace=True)
+
     df = df.dropna(subset=['RedFighter', 'BlueFighter', 'Winner'])
     df = df[df['Winner'].isin(['Red', 'Blue'])]
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+    required_columns = [
+        'RedHeight', 'BlueHeight', 'RedReach', 'BlueReach',
+        'RedAge', 'BlueAge', 'RedStance', 'BlueStance', 'WeightClass'
+    ]
+    df = df.dropna(subset=required_columns)
     return df
 
-df = load_data()
-
 # --- Feature Engineering ---
-@st.cache_data
 def add_fighter_features(df):
     fighter_stats = {}
-    df_sorted = df.sort_values(by='Date')
+    df_sorted = df.sort_values(by='Date', ascending=True)
 
     for fighter in pd.concat([df['RedFighter'], df['BlueFighter']]).unique():
         fights = df_sorted[(df_sorted['RedFighter'] == fighter) | (df_sorted['BlueFighter'] == fighter)]
         wins = []
-
         for _, row in fights.iterrows():
             if row['RedFighter'] == fighter:
                 wins.append(row['Winner'] == 'Red')
@@ -55,30 +67,43 @@ def add_fighter_features(df):
 
     df['RedWinStreak'] = df['RedFighter'].map(lambda x: fighter_stats.get(x, {}).get('WinStreak', 0))
     df['BlueWinStreak'] = df['BlueFighter'].map(lambda x: fighter_stats.get(x, {}).get('WinStreak', 0))
-
     df['RedRecentWinRate'] = df['RedFighter'].map(lambda x: fighter_stats.get(x, {}).get('RecentWinRate', 0))
     df['BlueRecentWinRate'] = df['BlueFighter'].map(lambda x: fighter_stats.get(x, {}).get('RecentWinRate', 0))
-
     df['RedTotalFights'] = df['RedFighter'].map(lambda x: fighter_stats.get(x, {}).get('TotalFights', 0))
     df['BlueTotalFights'] = df['BlueFighter'].map(lambda x: fighter_stats.get(x, {}).get('TotalFights', 0))
-    
     return df
 
+# --- Load Data and Engineer Features ---
+df = load_data()
 df = add_fighter_features(df)
 
-# --- Encode Winner ---
+stance_map = {stance: i for i, stance in enumerate(df['RedStance'].dropna().unique())}
+df['RedStanceNum'] = df['RedStance'].map(stance_map)
+df['BlueStanceNum'] = df['BlueStance'].map(stance_map)
+
+df['HeightDiff'] = df['RedHeight'] - df['BlueHeight']
+df['ReachDiff'] = df['RedReach'] - df['BlueReach']
+df['AgeDiff'] = df['RedAge'] - df['BlueAge']
+df['StanceDiff'] = df['RedStanceNum'] - df['BlueStanceNum']
+
+weight_dummies = pd.get_dummies(df['WeightClass'], prefix='Weight')
+df = pd.concat([df, weight_dummies], axis=1)
+
 label_enc = LabelEncoder()
 df['WinnerEncoded'] = label_enc.fit_transform(df['Winner'])
 
-# --- Features & Model ---
 features = [
     'RedWinStreak', 'BlueWinStreak',
     'RedRecentWinRate', 'BlueRecentWinRate',
-    'RedTotalFights', 'BlueTotalFights'
-]
+    'RedTotalFights', 'BlueTotalFights',
+    'HeightDiff', 'ReachDiff', 'AgeDiff', 'StanceDiff'
+] + list(weight_dummies.columns)
 
 X = df[features]
 y = df['WinnerEncoded']
+
+imputer = SimpleImputer(strategy='mean')
+X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
@@ -93,46 +118,59 @@ ensemble = VotingClassifier(estimators=[
 ], voting='soft')
 
 ensemble.fit(X_train, y_train)
+accuracy = accuracy_score(y_test, ensemble.predict(X_test))
 
-# --- UI ---
+# --- Streamlit UI ---
 st.title("🥋 UFC Fight Predictor")
-st.write("Select two fighters to predict who would win based on historical data.")
+st.markdown(f"Model Accuracy: **{accuracy:.2%}**")
 
-fighters = sorted(set(df['RedFighter']).union(df['BlueFighter']))
-fighter1 = st.selectbox("Fighter A", fighters)
-fighter2 = st.selectbox("Fighter B", [f for f in fighters if f != fighter1])
+fighter_list = sorted(set(df['RedFighter'].unique()).union(df['BlueFighter'].unique()))
+fighter1 = st.selectbox("Select Fighter A", fighter_list)
+fighter2 = st.selectbox("Select Fighter B", [f for f in fighter_list if f != fighter1])
 
 def get_latest_stats(fighter_name):
-    if fighter_name not in df['RedFighter'].values and fighter_name not in df['BlueFighter'].values:
-        return {'WinStreak': 0, 'RecentWinRate': 0.0, 'TotalFights': 0}
+    row = df[(df['RedFighter'] == fighter_name) | (df['BlueFighter'] == fighter_name)].iloc[-1]
+    stance_num = stance_map.get(row['RedStance'] if row['RedFighter'] == fighter_name else row['BlueStance'], 0)
     return {
-        'WinStreak': df[df['RedFighter'] == fighter_name]['RedWinStreak'].iloc[-1]
-                    if fighter_name in df['RedFighter'].values else df[df['BlueFighter'] == fighter_name]['BlueWinStreak'].iloc[-1],
-        'RecentWinRate': df[df['RedFighter'] == fighter_name]['RedRecentWinRate'].iloc[-1]
-                        if fighter_name in df['RedFighter'].values else df[df['BlueFighter'] == fighter_name]['BlueRecentWinRate'].iloc[-1],
-        'TotalFights': df[df['RedFighter'] == fighter_name]['RedTotalFights'].iloc[-1]
-                      if fighter_name in df['RedFighter'].values else df[df['BlueFighter'] == fighter_name]['BlueTotalFights'].iloc[-1]
+        'WinStreak': row['RedWinStreak'] if row['RedFighter'] == fighter_name else row['BlueWinStreak'],
+        'RecentWinRate': row['RedRecentWinRate'] if row['RedFighter'] == fighter_name else row['BlueRecentWinRate'],
+        'TotalFights': row['RedTotalFights'] if row['RedFighter'] == fighter_name else row['BlueTotalFights'],
+        'Height': row['RedHeight'] if row['RedFighter'] == fighter_name else row['BlueHeight'],
+        'Reach': row['RedReach'] if row['RedFighter'] == fighter_name else row['BlueReach'],
+        'Age': row['RedAge'] if row['RedFighter'] == fighter_name else row['BlueAge'],
+        'Stance': stance_num,
+        'WeightClass': row['WeightClass']
     }
 
 if st.button("Predict Winner"):
     stats1 = get_latest_stats(fighter1)
     stats2 = get_latest_stats(fighter2)
 
-    input_data = pd.DataFrame([{
+    input_row = {
         'RedWinStreak': stats1['WinStreak'],
         'BlueWinStreak': stats2['WinStreak'],
         'RedRecentWinRate': stats1['RecentWinRate'],
         'BlueRecentWinRate': stats2['RecentWinRate'],
         'RedTotalFights': stats1['TotalFights'],
-        'BlueTotalFights': stats2['TotalFights']
-    }])
+        'BlueTotalFights': stats2['TotalFights'],
+        'HeightDiff': stats1['Height'] - stats2['Height'],
+        'ReachDiff': stats1['Reach'] - stats2['Reach'],
+        'AgeDiff': stats1['Age'] - stats2['Age'],
+        'StanceDiff': stats1['Stance'] - stats2['Stance'],
+    }
 
-    prediction_proba = ensemble.predict_proba(input_data)[0]
-    predicted_label = ensemble.predict(input_data)[0]
+    for col in weight_dummies.columns:
+        input_row[col] = 1 if stats1['WeightClass'] in col else 0
+
+    input_df = pd.DataFrame([input_row])
+    input_df = pd.DataFrame(imputer.transform(input_df), columns=input_df.columns)
+
+    prediction_proba = ensemble.predict_proba(input_df)[0]
+    predicted_label = ensemble.predict(input_df)[0]
     predicted_color = label_enc.inverse_transform([predicted_label])[0]
-
     confidence = np.max(prediction_proba) * 100
-    winner_name = fighter1 if predicted_color == 'Red' else fighter2
+    predicted_name = fighter1 if predicted_color == 'Red' else fighter2
 
-    st.success(f"🏆 **Predicted Winner:** {winner_name}")
-    st.info(f"🔮 **Confidence:** {confidence:.2f}%")
+    st.subheader("🏆 Prediction")
+    st.success(f"**Predicted Winner:** {predicted_name}")
+    st.markdown(f"🔮 **Confidence:** {confidence:.2f}%")
